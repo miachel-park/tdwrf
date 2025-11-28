@@ -1,0 +1,27 @@
+# Build directories
+build/
+lib/
+
+# Object files
+*.o
+*.a
+*.so
+
+# Executables
+examples/example_usage
+examples/sample_target
+
+# Dump files
+*.txt
+dump_*
+
+# Editor files
+*.swp
+*.swo
+*~
+.vscode/
+.idea/
+
+# OS files
+.DS_Store
+Thumbs.db
