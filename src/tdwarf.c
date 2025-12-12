@@ -22,6 +22,7 @@
 #include <sys/user.h>
 #include <sys/uio.h>
 
+#include <execinfo.h> // Required for backtrace
 #include <libelf.h>
 #include <gelf.h>
 #include <libdwarf/dwarf.h>
@@ -73,6 +74,159 @@ static const char* error_messages[] = {
     "No debug information available",
     "Internal error"
 };
+
+
+static tdwarf_error_t self_backtrace(tdwarf_context_t *ctx)
+{
+    if ( !ctx ) {
+        return TDWARF_ERR_INVALID_ARG;
+    }
+
+    // 함수 호출시 저장된 return address를 획득 하기 위해 backtrace 사용 
+    void* buffer[TDWARF_MAX_FRAMES];
+    int nptrs = backtrace(buffer, TDWARF_MAX_FRAMES);
+    
+    if (nptrs <= 0) {
+        return TDWARF_ERR_INTERNAL;
+    }
+
+    ctx->frame_count = nptrs;
+
+    // 함수 이름 문자열로 변환
+    char **symbols = backtrace_symbols(buffer, nptrs);
+    if (symbols == NULL) {
+        return TDWARF_ERR_INTERNAL;
+    }
+
+    // 프레임 정보 채우기
+    for ( int i = 0; i < nptrs; i++ ) {
+        tdwarf_frame_t *frame = &ctx->frames[i];
+        frame->pc = (uint64_t)(uintptr_t)buffer[i]; // 프로그램 카운터 설정
+        frame->frame_level = i;
+
+        // BS, SP는 설정 불가
+        frame->sp = 0;
+        frame->bp = 0;
+
+        snprintf(frame->function_name, TDWARF_MAX_NAME_LEN, "%s", symbols[i]);
+    }
+    
+    free(symbols);
+
+    return TDWARF_OK;
+}
+
+static tdwarf_error_t backtrace_with_ptrace(tdwarf_context_t *ctx)
+{
+    struct user_regs_struct regs;
+    
+    if ( !ctx ) {
+        return TDWARF_ERR_INVALID_ARG;
+    }
+
+    if ( ptrace(PTRACE_GETREGS, ctx->target_pid, NULL, &regs) < 0 ) {
+        DEBUG_PRINT("ptrace GETREGS failed: %s", strerror(errno));
+        return TDWARF_ERR_PTRACE;
+    }
+
+    ctx->frame_count = 0;
+
+#if defined(__x86_64__)
+    {
+        uint64_t pc = regs.rip;
+        uint64_t sp = regs.rsp;
+        uint64_t bp = regs.rbp;
+#elif defined(__i386__)
+    {
+        uint64_t pc = regs.eip;
+        uint64_t sp = regs.esp;
+        uint64_t bp = regs.ebp;
+#elif defined(__aarch64__)
+    {
+        uint64_t pc = regs.pc;
+        uint64_t sp = regs.sp;
+        uint64_t bp = regs.regs[29];
+#else
+    {
+        uint64_t pc = 0;
+        uint64_t sp = 0;
+        uint64_t bp = 0;
+#endif
+
+        DEBUG_PRINT("Initial registers: PC=0x%lX, SP=0x%lX, BP=0x%lX", 
+            (unsigned long)pc, (unsigned long)sp, (unsigned long)bp);
+        
+        while( ctx->frame_count < TDWARF_MAX_FRAMES && bp != 0 && pc != 0) {
+            uint64_t next_bp = 0;
+            uint64_t next_pc = 0;
+            tdwarf_frame_t *frame = &ctx->frames[ctx->frame_count];
+
+            // --- 1. 유효성 검사: 주소 범위 유효성 ---
+            // (BP, PC가 널이 아닌) 64비트 시스템에서 주소가 너무 크거나(커널 영역이나 유효 범위 밖), 
+            // 너무 작아(0에 가까워) 비정상적인 경우를 검사합니다.
+            // 0x1000 (4KB)는 최소한의 유효한 페이지 주소로 가정합니다.
+            if ( bp < 0x1000 || pc < 0x1000 ) {
+                DEBUG_PRINT("[TDWARF DEBUG] Abnormal BP/PC address detected (too small). Stopping unwind.");
+                break;
+            }
+
+            // 스택 언와인딩은 낮은 주소로 진행되어야 합니다.
+            // 다음 BP가 현재 BP보다 크다면 (주소 역전), 비정상적인 상황일 수 있습니다.
+            // 단, 64비트 스택은 매우 크고 세그먼트가 분리될 수 있으므로, 엄격한 검사는 아닙니다.
+            // 다음 next_bp 읽기 전에 현재 bp가 이미 이전 next_bp보다 작아야 합니다.
+            // 이 로직은 첫 프레임 이후부터 적용 가능하므로, 2번째 프레임부터 검사합니다.
+            if ( ctx->frame_count > 0 && bp > ctx->frames[ctx->frame_count - 1].bp ) {
+                DEBUG_PRINT("[TDWARF DEBUG] Abnormal stack direction detected (BP increasing). Stopping unwind.");
+                break;
+            }
+
+            frame->pc = pc;
+            frame->sp = sp;
+            frame->bp = bp;
+            frame->frame_level = ctx->frame_count;
+            frame->var_count = 0;
+
+            ctx->frame_count++;
+
+            // 다음 프레임의 BP와 PC 읽기
+            if ( tdwarf_read_memory(ctx, bp + 8, &next_bp, sizeof(next_bp)) != TDWARF_OK ) {
+                break;
+            }
+            if ( tdwarf_read_memory(ctx, bp + 16, &next_pc, sizeof(next_pc)) != TDWARF_OK ) {
+                break;
+            }
+
+            // --- 2. 유효성 검사: 다음 주소 값 패턴 검사 ---
+            // 64비트 환경에서 0xFFFFFFFF로 시작하는 주소는 종종 커널 주소나 비정상적인 경계를 나타냅니다.
+            // 0xFFFF000000000000는 커널 영역의 일반적인 경계 값입니다.
+            if ( (next_pc & 0xFFFF000000000000) == 0xFFFF000000000000 ) {
+                DEBUG_PRINT("[TDWARF DEBUG] Abnormal next PC pattern (Kernel/Sentinel value) detected: 0x%lX. Stopping unwind.", (unsigned long)next_pc);
+                break;
+            }
+
+            // 다음 BP가 유효한 스택 주소 범위에서 크게 벗어나 힙이나 다른 영역을 가리키는 경우 (정확한 검사는 어려움)
+            // 여기서는 간단히 0x1000보다 작거나 0xFFFFFFFFFFFFFFF0와 같은 매우 높은 주소를 검사합니다.
+            if ( next_bp < 0x1000 || next_bp >= 0xFFFFFFFFFFFFFFF0 ) {
+                DEBUG_PRINT("[TDWARF DEBUG] Abnormal next BP address detected: 0x%lX. Stopping unwind.", (unsigned long)next_bp);
+                break;
+            }
+            // --- End: 다음 주소 값 패턴 검사 ---
+
+            pc = next_pc;
+            bp = next_bp;
+            sp = bp + 24; // 스택 프레임 크기 가정
+            DEBUG_PRINT("next registers: PC=0x%lX, SP=0x%lX, BP=0x%lX", 
+            (unsigned long)pc, (unsigned long)sp, (unsigned long)bp);
+
+            // --- 3. 최종 중지 조건: BP/PC가 0이 되어 정상적으로 끝남 ---
+            if ( bp == 0 || pc == 0) {
+                DEBUG_PRINT("[TDWARF DEBUG] Unwind chain ended normally (BP or PC is 0).");
+            }
+        }
+    }
+
+    return TDWARF_OK;
+}
 
 /*
  * Helper macros for safe type conversion (avoid strict-aliasing issues)
@@ -256,6 +410,7 @@ static uint64_t get_load_address(pid_t pid, const char *exe_path, int is_pie)
     char *basename_exe;
     FILE *maps;
     uint64_t load_addr = 0;
+    int found = 0;
     
     if (!is_pie) {
         DEBUG_PRINT("Non-PIE executable: using load_address = 0 (DWARF addresses are absolute)");
@@ -276,16 +431,33 @@ static uint64_t get_load_address(pid_t pid, const char *exe_path, int is_pie)
         basename_exe = (char*)exe_path;
     }
     
-    while (fgets(line, sizeof(line), maps)) {
-        if ((strstr(line, exe_path) || strstr(line, basename_exe)) && 
-            strstr(line, "r-xp")) {
-            char *dash = strchr(line, '-');
-            if (dash) {
-                *dash = '\0';
-                load_addr = strtoull(line, NULL, 16);
-                DEBUG_PRINT("PIE executable: found load address 0x%lX for %s", 
-                           (unsigned long)load_addr, basename_exe);
-                break;
+    // PIE 실행 파일의 정확한 로드 주소(Base Address)를 얻으려면, 권한(r-xp)을 따지지 말고, 
+    // 해당 파일 경로와 일치하는 가장 첫 번째 맵핑 주소를 찾아야 합니다.
+    while( fgets(line, sizeof(line), maps) ) {
+        unsigned long start_addr, end_addr, offset;
+        char perms[16]; // 권한 문자열 (예: r-xp)
+
+        // /proc/[pid]/maps 형식 파싱:
+        // address           perms offset  dev   inode   pathname
+        // 562ca0a0b000-562ca... r--p 00000000 08:30 ... /usr/bin/cat
+        
+        // sscanf로 필요한 앞부분 필드(시작주소, 끝주소, 권한, 오프셋)를 추출합니다.
+        if (sscanf(line, "%lx-%lx %s %lx", &start_addr, &end_addr, perms, &offset) != 4) {
+            continue; // 파싱 실패 시 다음 라인으로
+        }
+
+        // 파일경로가 포함되어 있는지 확인 
+        if ( strstr(line, exe_path) || strstr(line, basename_exe) ) {
+            // 오프셋이 0인지 확인 (선택 사항이지만 정확도 높임
+            // 보통 첫 번째 로드 세그먼트의 파일 오프셋은 0입니다.
+            // 맵 파일 포맷: address perms offset dev inode pathname
+            // 예: ... r--p 00000000 ...
+            if (offset == 0) {
+                load_addr = (uint64_t)start_addr;
+                DEBUG_PRINT("PIE executable: found load address 0x%lX for %s (offset 0)", 
+                    (unsigned long)load_addr, basename_exe);
+                found = 1;
+                break; // Base Address를 찾았으므로 루프 종료
             }
         }
     }
@@ -528,11 +700,12 @@ tdwarf_error_t tdwarf_read_memory(tdwarf_context_t *ctx,
         return TDWARF_ERR_INVALID_ARG;
     }
     
-    snprintf(proc_mem_path, sizeof(proc_mem_path), 
-             "/proc/%d/mem", ctx->target_pid);
+    snprintf(proc_mem_path, sizeof(proc_mem_path), "/proc/%d/mem", ctx->target_pid);
     
     fd = open(proc_mem_path, O_RDONLY);
     if (fd >= 0) {
+        DEBUG_PRINT("Reading memory from %s at 0x%lX, len=%zu", 
+            proc_mem_path, (unsigned long)addr, len);
         if (lseek(fd, addr, SEEK_SET) == (off_t)addr) {
             bytes_read = read(fd, buf, len);
             close(fd);
@@ -540,8 +713,11 @@ tdwarf_error_t tdwarf_read_memory(tdwarf_context_t *ctx,
                 return TDWARF_OK;
             }
         } else {
+            DEBUG_PRINT("lseek failed: %s", strerror(errno));
             close(fd);
         }
+    } else {
+        DEBUG_PRINT("Cannot open %s: %s", proc_mem_path, strerror(errno));
     }
     
     {
@@ -555,25 +731,30 @@ tdwarf_error_t tdwarf_read_memory(tdwarf_context_t *ctx,
         bytes_read = process_vm_readv(ctx->target_pid, 
                                        &local_iov, 1,
                                        &remote_iov, 1, 0);
+        DEBUG_PRINT("process_vm_readv read %zd bytes from 0x%lX", 
+                    bytes_read, (unsigned long)addr);
         if (bytes_read == (ssize_t)len) {
             return TDWARF_OK;
         }
+        DEBUG_PRINT("process_vm_readv failed: %s", strerror(errno));
     }
     
     if (ctx->attached && ctx->target_pid != getpid()) {
         size_t offset = 0;
+        DEBUG_PRINT("reading memory via ptrace PEEKDATA at 0x%lX, len=%zu", 
+            (unsigned long)addr, len);
+        
         while (offset < len) {
             long word;
             size_t copy_len;
             errno = 0;
-            word = ptrace(PTRACE_PEEKDATA, ctx->target_pid, 
-                         addr + offset, NULL);
+            word = ptrace(PTRACE_PEEKDATA, ctx->target_pid, addr + offset, NULL);
             if (errno != 0) {
+                DEBUG_PRINT("ptrace PEEKDATA failed: %s", strerror(errno));
                 return TDWARF_ERR_READ_MEM;
             }
             
-            copy_len = (len - offset < sizeof(long)) ? 
-                              (len - offset) : sizeof(long);
+            copy_len = (len - offset < sizeof(long)) ? (len - offset) : sizeof(long);
             memcpy((char*)buf + offset, &word, copy_len);
             offset += sizeof(long);
         }
@@ -1524,76 +1705,21 @@ static void collect_all_variables(tdwarf_context_t *ctx)
  */
 tdwarf_error_t tdwarf_unwind_stack(tdwarf_context_t *ctx)
 {
-    struct user_regs_struct regs;
-    
     if (!ctx) {
         return TDWARF_ERR_INVALID_ARG;
     }
     
-    if (ctx->target_pid == getpid()) {
-        ctx->frame_count = 0;
-        collect_all_variables(ctx);
-        return TDWARF_OK;
-    }
-    
-    if (ptrace(PTRACE_GETREGS, ctx->target_pid, NULL, &regs) < 0) {
-        DEBUG_PRINT("PTRACE_GETREGS failed: %s", strerror(errno));
-        return TDWARF_ERR_PTRACE;
-    }
-    
     ctx->frame_count = 0;
-    
-#if defined(__x86_64__)
-    {
-        uint64_t pc = regs.rip;
-        uint64_t sp = regs.rsp;
-        uint64_t bp = regs.rbp;
-#elif defined(__i386__)
-    {
-        uint64_t pc = regs.eip;
-        uint64_t sp = regs.esp;
-        uint64_t bp = regs.ebp;
-#elif defined(__aarch64__)
-    {
-        uint64_t pc = regs.pc;
-        uint64_t sp = regs.sp;
-        uint64_t bp = regs.regs[29];
-#else
-    {
-        uint64_t pc = 0;
-        uint64_t sp = 0;
-        uint64_t bp = 0;
-#endif
 
-        DEBUG_PRINT("Initial registers: PC=0x%lX, SP=0x%lX, BP=0x%lX", 
-                    (unsigned long)pc, (unsigned long)sp, (unsigned long)bp);
-        
-        while (ctx->frame_count < TDWARF_MAX_FRAMES && bp != 0 && pc != 0) {
-            uint64_t next_bp = 0, next_pc = 0;
-            tdwarf_frame_t *frame = &ctx->frames[ctx->frame_count];
-            
-            frame->pc = pc;
-            frame->sp = sp;
-            frame->bp = bp;
-            frame->frame_level = ctx->frame_count;
-            frame->var_count = 0;
-            
-            ctx->frame_count++;
-            
-            if (tdwarf_read_memory(ctx, bp, &next_bp, sizeof(next_bp)) != TDWARF_OK) {
-                break;
-            }
-            if (tdwarf_read_memory(ctx, bp + sizeof(uint64_t), &next_pc, sizeof(next_pc)) != TDWARF_OK) {
-                break;
-            }
-            
-            if (next_bp <= bp || next_bp == 0 || next_pc == 0) {
-                break;
-            }
-            
-            bp = next_bp;
-            pc = next_pc;
-            sp = bp + 2 * sizeof(uint64_t);
+    if (ctx->target_pid == getpid()) {
+        if ( self_backtrace(ctx) != TDWARF_OK) {
+            DEBUG_PRINT("Self backtrace failed");
+            return TDWARF_ERR_INTERNAL;
+        }
+        return TDWARF_OK;
+    } else {
+        if ( backtrace_with_ptrace(ctx) != TDWARF_OK ) {
+            return TDWARF_ERR_INTERNAL;
         }
     }
     

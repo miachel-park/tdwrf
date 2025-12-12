@@ -25,6 +25,7 @@ OBJS = $(SRCS:$(SRC_DIR)/%.c=$(BUILD_DIR)/%.o)
 # Examples
 EXAMPLE_USAGE = $(EXAMPLES_DIR)/example_usage
 SAMPLE_TARGET = $(EXAMPLES_DIR)/sample_target
+EXAMPLE_BACKTRACE = $(EXAMPLES_DIR)/example_backtrace
 
 .PHONY: all clean install examples help
 
@@ -58,7 +59,7 @@ $(EXAMPLE_USAGE): $(EXAMPLES_DIR)/example_usage.c $(LIB_STATIC)
 	$(CC) -g -O0 -std=gnu99 $< -o $@ -I$(INC_DIR) -L$(LIB_DIR) -ltdwarf $(LDFLAGS)
 
 $(SAMPLE_TARGET): $(EXAMPLES_DIR)/sample_target.c
-	$(CC) -g -O0 -fno-omit-frame-pointer $< -o $@
+	$(CC) -rdynamic -g -O0 -fno-omit-frame-pointer $< -o $@
 
 clean:
 	rm -rf $(BUILD_DIR) $(LIB_DIR)
