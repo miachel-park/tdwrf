@@ -77,7 +77,8 @@ static const char* error_messages[] = {
 
 static void process_struct_members(tdwarf_context_t *ctx, Dwarf_Debug dbg, Dwarf_Die struct_type_die, tdwarf_var_t *parent_var);
 
-static tdwarf_error_t self_backtrace(tdwarf_context_t *ctx) {
+static tdwarf_error_t self_backtrace(tdwarf_context_t *ctx) 
+{
     if ( !ctx ) {
         return TDWARF_ERR_INVALID_ARG;
     }
@@ -117,7 +118,8 @@ static tdwarf_error_t self_backtrace(tdwarf_context_t *ctx) {
     return TDWARF_OK;
 }
 
-static tdwarf_error_t backtrace_with_ptrace(tdwarf_context_t *ctx) {
+static tdwarf_error_t backtrace_with_ptrace(tdwarf_context_t *ctx) 
+{
     struct user_regs_struct regs;
     
     if ( !ctx ) {
@@ -545,7 +547,8 @@ static tdwarf_type_kind_t get_type_kind_from_encoding(Dwarf_Debug dbg, Dwarf_Die
 /*
  * Get string attribute from DIE
  */
-static int get_die_name(Dwarf_Debug dbg, Dwarf_Die die, char *buf, size_t buf_size) {
+static int get_die_name(Dwarf_Debug dbg, Dwarf_Die die, char *buf, size_t buf_size) 
+{
     Dwarf_Attribute attr;
     char *name = NULL;
     Dwarf_Error error;
@@ -1019,8 +1022,28 @@ static void process_struct_members(tdwarf_context_t *ctx, Dwarf_Debug dbg, Dwarf
 
             if (parent_var->member_count >= parent_var->member_capacity) {
                 // 용량 확장 로직 필요 (realloc 등)
-                // 여기서는 생략하고 break
-                break; 
+                size_t old_capacity = parent_var->member_capacity;
+                size_t new_capacity = (old_capacity == 0) ? 16 : old_capacity * 2; // 최소 16으로 시작 가정
+                size_t new_size = new_capacity * sizeof(tdwarf_var_t);
+
+                if (new_capacity < old_capacity) {
+                    DEBUG_PRINT("emory reallocation failed: capacity overflow detected.");
+                    break;
+                }
+
+                // 메모리 할당
+                tdwarf_var_t *new_members = realloc(parent_var->members, new_size);
+                if (new_members) {
+                    parent_var->members = new_members;
+                    parent_var->member_capacity = new_capacity;
+
+                    DEBUG_PRINT("Reallocated member array: new capacity %zu", parent_var->member_capacity);
+                } else {
+                    // 4. 메모리 할당 실패 시 처리 및 로그
+                    DEBUG_PRINT("Memory reallocation failed for %s members (requested %zu bytes). Stopping struct iteration.", 
+                        parent_var->name, new_size);
+                    break; // 루프를 중지하여 안전하게 종료
+                } 
             }
             member = &parent_var->members[parent_var->member_count];
 
@@ -1508,7 +1531,8 @@ static void collect_all_variables(tdwarf_context_t *ctx)
 /*
  * Stack unwinding
  */
-tdwarf_error_t tdwarf_unwind_stack(tdwarf_context_t *ctx) {
+tdwarf_error_t tdwarf_unwind_stack(tdwarf_context_t *ctx) 
+{
     if (!ctx) {
         return TDWARF_ERR_INVALID_ARG;
     }
@@ -1535,7 +1559,8 @@ tdwarf_error_t tdwarf_unwind_stack(tdwarf_context_t *ctx) {
     return TDWARF_OK;
 }
 
-tdwarf_error_t tdwarf_resolve_variables(tdwarf_context_t *ctx, int frame_index) {
+tdwarf_error_t tdwarf_resolve_variables(tdwarf_context_t *ctx, int frame_index) 
+{
     if (!ctx || frame_index < 0 || frame_index >= ctx->frame_count) {
         return TDWARF_ERR_INVALID_ARG;
     }
@@ -1545,8 +1570,8 @@ tdwarf_error_t tdwarf_resolve_variables(tdwarf_context_t *ctx, int frame_index) 
 /*
  * Format hex string
  */
-int tdwarf_format_hex(const uint8_t *data, size_t len,
-    char *buf, size_t buf_size, int uppercase) {
+int tdwarf_format_hex(const uint8_t *data, size_t len, char *buf, size_t buf_size, int uppercase) 
+{
     const char *fmt = uppercase ? "%02X" : "%02x";
     size_t pos = 0;
     size_t i;
@@ -1568,7 +1593,8 @@ int tdwarf_format_hex(const uint8_t *data, size_t len,
 /*
  * Format value based on type
  */
-static void format_value_by_type(const tdwarf_var_t *var, char *buf, size_t buf_size) {
+static void format_value_by_type(const tdwarf_var_t *var, char *buf, size_t buf_size) 
+{
     if (var->data_len == 0) {
         snprintf(buf, buf_size, "<unavailable>");
         return;
@@ -1664,7 +1690,8 @@ static void format_value_by_type(const tdwarf_var_t *var, char *buf, size_t buf_
     }
 }
 
-static void print_var_recursive(FILE *stream, tdwarf_var_t *var, int indent, const tdwarf_config_t *config) {
+static void print_var_recursive(FILE *stream, tdwarf_var_t *var, int indent, const tdwarf_config_t *config) 
+{
     char value_buf[512];
     char indent_str[64] = {0};
     int k;
@@ -1680,6 +1707,17 @@ static void print_var_recursive(FILE *stream, tdwarf_var_t *var, int indent, con
             var->type_name[0] ? var->type_name : "<unknown>",
             (unsigned long)var->address,
             value_buf);
+    
+    if (var->data_len > 8) {
+        size_t k;
+        char hex_buf[TDWARF_MAX_DUMP_SIZE * 3 + 1];
+        fprintf(stream, "  Hex dump (%zu bytes):\n", var->data_len);
+        for (k = 0; k < var->data_len && k < 512; k += 16) {
+            size_t line_len = (var->data_len - k > 16) ? 16 : (var->data_len - k);
+            tdwarf_format_hex(var->data + k, line_len, hex_buf, sizeof(hex_buf), 1);
+            fprintf(stream, "    %04zX: %s\n", k, hex_buf);
+        }
+    }
 
     // 구조체 멤버 출력
     if (var->type_kind == TDWARF_TYPE_STRUCT && var->member_count > 0) {
@@ -1693,7 +1731,8 @@ static void print_var_recursive(FILE *stream, tdwarf_var_t *var, int indent, con
 /*
  * Context creation/destruction 
  */
-tdwarf_error_t tdwarf_context_create(pid_t pid, tdwarf_context_t **ctx) {
+tdwarf_error_t tdwarf_context_create(pid_t pid, tdwarf_context_t **ctx) 
+{
     tdwarf_context_t *new_ctx;
     tdwarf_internal_t *internal;
     int i;
@@ -1748,7 +1787,8 @@ tdwarf_error_t tdwarf_context_create(pid_t pid, tdwarf_context_t **ctx) {
     return TDWARF_OK;
 }
 
-void tdwarf_context_destroy(tdwarf_context_t *ctx) {
+void tdwarf_context_destroy(tdwarf_context_t *ctx) 
+{
     tdwarf_internal_t *internal;
     int i;
     
@@ -1792,7 +1832,8 @@ void tdwarf_context_destroy(tdwarf_context_t *ctx) {
 /*
  * Ptrace attachment/detachment
  */
-tdwarf_error_t tdwarf_attach(tdwarf_context_t *ctx) {
+tdwarf_error_t tdwarf_attach(tdwarf_context_t *ctx) 
+{
     int status;
     
     if (!ctx) {
@@ -1819,7 +1860,8 @@ tdwarf_error_t tdwarf_attach(tdwarf_context_t *ctx) {
     return TDWARF_OK;
 }
 
-tdwarf_error_t tdwarf_detach(tdwarf_context_t *ctx) {
+tdwarf_error_t tdwarf_detach(tdwarf_context_t *ctx) 
+{
     if (!ctx || !ctx->attached) {
         return TDWARF_ERR_INVALID_ARG;
     }
@@ -1837,7 +1879,8 @@ tdwarf_error_t tdwarf_detach(tdwarf_context_t *ctx) {
 /*
  * Load DWARF debug information
  */
-tdwarf_error_t tdwarf_load_debug_info(tdwarf_context_t *ctx) {
+tdwarf_error_t tdwarf_load_debug_info(tdwarf_context_t *ctx) 
+{
     tdwarf_internal_t *internal;
     int res;
     
@@ -1883,7 +1926,8 @@ tdwarf_error_t tdwarf_load_debug_info(tdwarf_context_t *ctx) {
 /*
  * Read memory from target process
  */
-tdwarf_error_t tdwarf_read_memory(tdwarf_context_t *ctx, uint64_t addr, void *buf, size_t len) {
+tdwarf_error_t tdwarf_read_memory(tdwarf_context_t *ctx, uint64_t addr, void *buf, size_t len) 
+{
     char proc_mem_path[64];
     int fd;
     ssize_t bytes_read;
@@ -1957,7 +2001,8 @@ tdwarf_error_t tdwarf_read_memory(tdwarf_context_t *ctx, uint64_t addr, void *bu
 /*
  * Dump symbol information to stream/file
  */
-tdwarf_error_t tdwarf_dump_to_stream(tdwarf_context_t *ctx, FILE *stream, const tdwarf_config_t *config) {
+tdwarf_error_t tdwarf_dump_to_stream(tdwarf_context_t *ctx, FILE *stream, const tdwarf_config_t *config) 
+{
     tdwarf_internal_t *internal;
     tdwarf_config_t cfg;
     time_t now;
@@ -2095,7 +2140,8 @@ tdwarf_error_t tdwarf_dump_to_stream(tdwarf_context_t *ctx, FILE *stream, const 
     return TDWARF_OK;
 }
 
-tdwarf_error_t tdwarf_dump_to_file(tdwarf_context_t *ctx, const char *filename, const tdwarf_config_t *config) {
+tdwarf_error_t tdwarf_dump_to_file(tdwarf_context_t *ctx, const char *filename, const tdwarf_config_t *config) 
+{
     FILE *file;
     tdwarf_error_t err;
     
@@ -2117,7 +2163,8 @@ tdwarf_error_t tdwarf_dump_to_file(tdwarf_context_t *ctx, const char *filename, 
 /*
  * Signal handler
  */
-static void tdwarf_signal_handler(int signum, siginfo_t *info, void *context) {
+static void tdwarf_signal_handler(int signum, siginfo_t *info, void *context) 
+{
     char filename[1024];
     time_t now;
     struct tm *tm_info;
@@ -2153,7 +2200,8 @@ static void tdwarf_signal_handler(int signum, siginfo_t *info, void *context) {
     raise(signum);
 }
 
-tdwarf_error_t tdwarf_install_signal_handlers(const char *output_dir) {
+tdwarf_error_t tdwarf_install_signal_handlers(const char *output_dir) 
+{
     struct sigaction sa;
     int signals[] = { SIGSEGV, SIGBUS, SIGFPE, SIGILL, SIGABRT };
     int num_signals = sizeof(signals) / sizeof(signals[0]);
@@ -2179,7 +2227,8 @@ tdwarf_error_t tdwarf_install_signal_handlers(const char *output_dir) {
     return TDWARF_OK;
 }
 
-void tdwarf_remove_signal_handlers(void) {
+void tdwarf_remove_signal_handlers(void) 
+{
     int signals[] = { SIGSEGV, SIGBUS, SIGFPE, SIGILL, SIGABRT };
     int num_signals = sizeof(signals) / sizeof(signals[0]);
     int i;
@@ -2195,7 +2244,8 @@ void tdwarf_remove_signal_handlers(void) {
     g_handlers_installed = 0;
 }
 
-tdwarf_error_t tdwarf_dump_on_signal(int signum, const char *output_path) {
+tdwarf_error_t tdwarf_dump_on_signal(int signum, const char *output_path) 
+{
     FILE *file;
     time_t now;
     char time_str[64];
