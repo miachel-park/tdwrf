@@ -61,11 +61,16 @@ typedef struct tdwarf_var {
     char type_name[TDWARF_MAX_TYPE_LEN];
     uint64_t address;
     size_t size;
-    tdwarf_type_kind_t type_kind;
     uint8_t data[TDWARF_MAX_DUMP_SIZE];
     size_t data_len;
     int is_local;
     int frame_level;
+    tdwarf_type_kind_t type_kind;
+
+    /* 구조체 멤버 정보 */
+    struct tdwarf_var *members;
+    int member_count;
+    int member_capacity;
 } tdwarf_var_t;
 
 /* Stack frame information */

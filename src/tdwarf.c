@@ -75,9 +75,9 @@ static const char* error_messages[] = {
     "Internal error"
 };
 
+static void process_struct_members(tdwarf_context_t *ctx, Dwarf_Debug dbg, Dwarf_Die struct_type_die, tdwarf_var_t *parent_var);
 
-static tdwarf_error_t self_backtrace(tdwarf_context_t *ctx)
-{
+static tdwarf_error_t self_backtrace(tdwarf_context_t *ctx) {
     if ( !ctx ) {
         return TDWARF_ERR_INVALID_ARG;
     }
@@ -109,6 +109,7 @@ static tdwarf_error_t self_backtrace(tdwarf_context_t *ctx)
         frame->bp = 0;
 
         snprintf(frame->function_name, TDWARF_MAX_NAME_LEN, "%s", symbols[i]);
+        fprintf(stdout, "function name = %s\n", frame->function_name);
     }
     
     free(symbols);
@@ -116,8 +117,7 @@ static tdwarf_error_t self_backtrace(tdwarf_context_t *ctx)
     return TDWARF_OK;
 }
 
-static tdwarf_error_t backtrace_with_ptrace(tdwarf_context_t *ctx)
-{
+static tdwarf_error_t backtrace_with_ptrace(tdwarf_context_t *ctx) {
     struct user_regs_struct regs;
     
     if ( !ctx ) {
@@ -410,7 +410,6 @@ static uint64_t get_load_address(pid_t pid, const char *exe_path, int is_pie)
     char *basename_exe;
     FILE *maps;
     uint64_t load_addr = 0;
-    int found = 0;
     
     if (!is_pie) {
         DEBUG_PRINT("Non-PIE executable: using load_address = 0 (DWARF addresses are absolute)");
@@ -456,7 +455,6 @@ static uint64_t get_load_address(pid_t pid, const char *exe_path, int is_pie)
                 load_addr = (uint64_t)start_addr;
                 DEBUG_PRINT("PIE executable: found load address 0x%lX for %s (offset 0)", 
                     (unsigned long)load_addr, basename_exe);
-                found = 1;
                 break; // Base Address를 찾았으므로 루프 종료
             }
         }
@@ -488,281 +486,6 @@ static int get_executable_path(pid_t pid, char *buf, size_t buf_size)
     return 0;
 }
 
-/*
- * Context creation
- */
-tdwarf_error_t tdwarf_context_create(pid_t pid, tdwarf_context_t **ctx)
-{
-    tdwarf_context_t *new_ctx;
-    tdwarf_internal_t *internal;
-    int i;
-    
-    if (!ctx) {
-        return TDWARF_ERR_INVALID_ARG;
-    }
-    
-    new_ctx = calloc(1, sizeof(tdwarf_context_t));
-    if (!new_ctx) {
-        return TDWARF_ERR_NO_MEMORY;
-    }
-    
-    internal = calloc(1, sizeof(tdwarf_internal_t));
-    if (!internal) {
-        free(new_ctx);
-        return TDWARF_ERR_NO_MEMORY;
-    }
-    internal->fd = -1;
-    internal->global_var_capacity = 512;
-    internal->global_vars = calloc(internal->global_var_capacity, sizeof(tdwarf_var_t));
-    if (!internal->global_vars) {
-        free(internal);
-        free(new_ctx);
-        return TDWARF_ERR_NO_MEMORY;
-    }
-    
-    new_ctx->target_pid = (pid == 0) ? getpid() : pid;
-    new_ctx->dwarf_handle = internal;
-    new_ctx->attached = 0;
-    
-    /* Initialize frame variable arrays */
-    for (i = 0; i < TDWARF_MAX_FRAMES; i++) {
-        new_ctx->frames[i].variables = calloc(256, sizeof(tdwarf_var_t));
-        new_ctx->frames[i].var_count = 0;
-        new_ctx->frames[i].var_capacity = 256;
-    }
-    
-    if (get_executable_path(new_ctx->target_pid, 
-                            new_ctx->executable_path,
-                            sizeof(new_ctx->executable_path)) < 0) {
-        for (i = 0; i < TDWARF_MAX_FRAMES; i++) {
-            if (new_ctx->frames[i].variables) free(new_ctx->frames[i].variables);
-        }
-        free(internal->global_vars);
-        free(internal);
-        free(new_ctx);
-        return TDWARF_ERR_OPEN_FAILED;
-    }
-    
-    *ctx = new_ctx;
-    return TDWARF_OK;
-}
-
-void tdwarf_context_destroy(tdwarf_context_t *ctx)
-{
-    tdwarf_internal_t *internal;
-    int i;
-    
-    if (!ctx) return;
-    
-    if (ctx->attached) {
-        tdwarf_detach(ctx);
-    }
-    
-    internal = (tdwarf_internal_t*)ctx->dwarf_handle;
-    if (internal) {
-        if (internal->dbg) {
-            Dwarf_Error err;
-            dwarf_finish(internal->dbg, &err);
-        }
-        if (internal->elf) {
-            elf_end(internal->elf);
-        }
-        if (internal->fd >= 0) {
-            close(internal->fd);
-        }
-        if (internal->global_vars) {
-            free(internal->global_vars);
-        }
-        free(internal);
-    }
-    
-    for (i = 0; i < TDWARF_MAX_FRAMES; i++) {
-        if (ctx->frames[i].variables) {
-            free(ctx->frames[i].variables);
-        }
-    }
-    
-    if (ctx->output_file) {
-        fclose(ctx->output_file);
-    }
-    
-    free(ctx);
-}
-
-/*
- * Ptrace attachment
- */
-tdwarf_error_t tdwarf_attach(tdwarf_context_t *ctx)
-{
-    int status;
-    
-    if (!ctx) {
-        return TDWARF_ERR_INVALID_ARG;
-    }
-    
-    if (ctx->target_pid == getpid()) {
-        ctx->attached = 1;
-        return TDWARF_OK;
-    }
-    
-    if (ptrace(PTRACE_ATTACH, ctx->target_pid, NULL, NULL) < 0) {
-        DEBUG_PRINT("ptrace ATTACH failed: %s", strerror(errno));
-        return TDWARF_ERR_PTRACE;
-    }
-    
-    if (waitpid(ctx->target_pid, &status, 0) < 0) {
-        ptrace(PTRACE_DETACH, ctx->target_pid, NULL, NULL);
-        return TDWARF_ERR_PTRACE;
-    }
-    
-    ctx->attached = 1;
-    DEBUG_PRINT("Attached to PID %d", ctx->target_pid);
-    return TDWARF_OK;
-}
-
-tdwarf_error_t tdwarf_detach(tdwarf_context_t *ctx)
-{
-    if (!ctx || !ctx->attached) {
-        return TDWARF_ERR_INVALID_ARG;
-    }
-    
-    if (ctx->target_pid != getpid()) {
-        if (ptrace(PTRACE_DETACH, ctx->target_pid, NULL, NULL) < 0) {
-            return TDWARF_ERR_PTRACE;
-        }
-    }
-    
-    ctx->attached = 0;
-    return TDWARF_OK;
-}
-
-/*
- * Load DWARF debug information
- */
-tdwarf_error_t tdwarf_load_debug_info(tdwarf_context_t *ctx)
-{
-    tdwarf_internal_t *internal;
-    int res;
-    
-    if (!ctx) {
-        return TDWARF_ERR_INVALID_ARG;
-    }
-    
-    internal = (tdwarf_internal_t*)ctx->dwarf_handle;
-    
-    internal->is_pie = check_is_pie(ctx->executable_path);
-    internal->load_address = get_load_address(ctx->target_pid, ctx->executable_path, internal->is_pie);
-    DEBUG_PRINT("Final load_address offset: 0x%lX (is_pie=%d)", 
-                (unsigned long)internal->load_address, internal->is_pie);
-    
-    internal->fd = open(ctx->executable_path, O_RDONLY);
-    if (internal->fd < 0) {
-        DEBUG_PRINT("Cannot open executable: %s", ctx->executable_path);
-        return TDWARF_ERR_OPEN_FAILED;
-    }
-    
-    internal->elf = elf_begin(internal->fd, ELF_C_READ, NULL);
-    if (!internal->elf) {
-        DEBUG_PRINT("elf_begin failed");
-        close(internal->fd);
-        internal->fd = -1;
-        return TDWARF_ERR_OPEN_FAILED;
-    }
-    
-    res = dwarf_elf_init(internal->elf, DW_DLC_READ, NULL, NULL,
-                         &internal->dbg, &internal->error);
-    if (res != DW_DLV_OK) {
-        DEBUG_PRINT("dwarf_elf_init failed: res=%d", res);
-        elf_end(internal->elf);
-        internal->elf = NULL;
-        close(internal->fd);
-        internal->fd = -1;
-        return TDWARF_ERR_NO_DWARF;
-    }
-    
-    DEBUG_PRINT("DWARF initialized successfully");
-    return TDWARF_OK;
-}
-
-/*
- * Read memory from target process
- */
-tdwarf_error_t tdwarf_read_memory(tdwarf_context_t *ctx, 
-                                   uint64_t addr, 
-                                   void *buf, 
-                                   size_t len)
-{
-    char proc_mem_path[64];
-    int fd;
-    ssize_t bytes_read;
-    
-    if (!ctx || !buf || len == 0) {
-        return TDWARF_ERR_INVALID_ARG;
-    }
-    
-    snprintf(proc_mem_path, sizeof(proc_mem_path), "/proc/%d/mem", ctx->target_pid);
-    
-    fd = open(proc_mem_path, O_RDONLY);
-    if (fd >= 0) {
-        DEBUG_PRINT("Reading memory from %s at 0x%lX, len=%zu", 
-            proc_mem_path, (unsigned long)addr, len);
-        if (lseek(fd, addr, SEEK_SET) == (off_t)addr) {
-            bytes_read = read(fd, buf, len);
-            close(fd);
-            if (bytes_read == (ssize_t)len) {
-                return TDWARF_OK;
-            }
-        } else {
-            DEBUG_PRINT("lseek failed: %s", strerror(errno));
-            close(fd);
-        }
-    } else {
-        DEBUG_PRINT("Cannot open %s: %s", proc_mem_path, strerror(errno));
-    }
-    
-    {
-        struct iovec local_iov;
-        struct iovec remote_iov;
-        local_iov.iov_base = buf;
-        local_iov.iov_len = len;
-        remote_iov.iov_base = (void*)addr;
-        remote_iov.iov_len = len;
-        
-        bytes_read = process_vm_readv(ctx->target_pid, 
-                                       &local_iov, 1,
-                                       &remote_iov, 1, 0);
-        DEBUG_PRINT("process_vm_readv read %zd bytes from 0x%lX", 
-                    bytes_read, (unsigned long)addr);
-        if (bytes_read == (ssize_t)len) {
-            return TDWARF_OK;
-        }
-        DEBUG_PRINT("process_vm_readv failed: %s", strerror(errno));
-    }
-    
-    if (ctx->attached && ctx->target_pid != getpid()) {
-        size_t offset = 0;
-        DEBUG_PRINT("reading memory via ptrace PEEKDATA at 0x%lX, len=%zu", 
-            (unsigned long)addr, len);
-        
-        while (offset < len) {
-            long word;
-            size_t copy_len;
-            errno = 0;
-            word = ptrace(PTRACE_PEEKDATA, ctx->target_pid, addr + offset, NULL);
-            if (errno != 0) {
-                DEBUG_PRINT("ptrace PEEKDATA failed: %s", strerror(errno));
-                return TDWARF_ERR_READ_MEM;
-            }
-            
-            copy_len = (len - offset < sizeof(long)) ? (len - offset) : sizeof(long);
-            memcpy((char*)buf + offset, &word, copy_len);
-            offset += sizeof(long);
-        }
-        return TDWARF_OK;
-    }
-    
-    return TDWARF_ERR_READ_MEM;
-}
 
 /*
  * Get type kind from DWARF encoding
@@ -822,9 +545,7 @@ static tdwarf_type_kind_t get_type_kind_from_encoding(Dwarf_Debug dbg, Dwarf_Die
 /*
  * Get string attribute from DIE
  */
-static int get_die_name(Dwarf_Debug dbg, Dwarf_Die die, 
-                        char *buf, size_t buf_size)
-{
+static int get_die_name(Dwarf_Debug dbg, Dwarf_Die die, char *buf, size_t buf_size) {
     Dwarf_Attribute attr;
     char *name = NULL;
     Dwarf_Error error;
@@ -853,8 +574,7 @@ static int get_die_name(Dwarf_Debug dbg, Dwarf_Die die,
 /*
  * Get type name recursively
  */
-static int get_type_name(Dwarf_Debug dbg, Dwarf_Die type_die,
-                         char *buf, size_t buf_size)
+static int get_type_name(Dwarf_Debug dbg, Dwarf_Die type_die, char *buf, size_t buf_size)
 {
     Dwarf_Half tag;
     Dwarf_Error error;
@@ -1164,8 +884,7 @@ static int parse_location_expr(const uint8_t *ops, size_t len, location_info_t *
 /*
  * Get variable location info from DW_AT_location
  */
-static int get_variable_location(Dwarf_Debug dbg, Dwarf_Die die, 
-                                  const char *var_name, location_info_t *loc)
+static int get_variable_location(Dwarf_Debug dbg, Dwarf_Die die, const char *var_name, location_info_t *loc)
 {
     Dwarf_Attribute attr;
     Dwarf_Error error;
@@ -1238,7 +957,7 @@ static int is_external_declaration(Dwarf_Debug dbg, Dwarf_Die die)
 /*
  * Fill variable info from type DIE
  */
-static void fill_var_type_info(Dwarf_Debug dbg, Dwarf_Die var_die, tdwarf_var_t *var)
+static void fill_var_type_info(Dwarf_Debug dbg, Dwarf_Die var_die, tdwarf_var_t *var, tdwarf_context_t *ctx)
 {
     Dwarf_Attribute type_attr;
     Dwarf_Error error;
@@ -1255,6 +974,11 @@ static void fill_var_type_info(Dwarf_Debug dbg, Dwarf_Die var_die, tdwarf_var_t 
                 get_type_name(dbg, type_die, var->type_name, sizeof(var->type_name));
                 var->size = get_type_size(dbg, type_die);
                 var->type_kind = get_type_kind_from_encoding(dbg, type_die);
+
+                /* check if there is type of structure to process members */
+                if ( var->type_kind == TDWARF_TYPE_STRUCT ) {
+                    process_struct_members(ctx, dbg, type_die, var);
+                }
                 dwarf_dealloc(dbg, type_die, DW_DLA_DIE);
             }
         }
@@ -1263,6 +987,95 @@ static void fill_var_type_info(Dwarf_Debug dbg, Dwarf_Die var_die, tdwarf_var_t 
     
     if (var->size == 0) {
         var->size = sizeof(void*);
+    }
+}
+
+static void process_struct_members(tdwarf_context_t *ctx, Dwarf_Debug dbg, Dwarf_Die struct_type_die, tdwarf_var_t *parent_var)
+{
+    Dwarf_Error error;
+    Dwarf_Die child_die = NULL;
+    Dwarf_Die sibling_die = NULL;
+    Dwarf_Half tag;
+    int res;
+
+    res = dwarf_child(struct_type_die, &child_die, &error);
+    if (res != DW_DLV_OK) {
+        return;
+    }
+
+    // 멤버 변수 저장을 위한 메모리 할당 (간단한 예시)
+    if (parent_var->member_capacity == 0) {
+        parent_var->member_capacity = 16; // 초기 용량
+        parent_var->members = calloc(parent_var->member_capacity, sizeof(tdwarf_var_t));
+    }
+
+    while (1) {
+        res = dwarf_tag(child_die, &tag, &error);
+        if (res == DW_DLV_OK && tag == DW_TAG_member) {
+            tdwarf_var_t *member;
+            char member_name[256] = {0};
+            Dwarf_Attribute attr;
+            Dwarf_Unsigned data_member_location = 0;
+
+            if (parent_var->member_count >= parent_var->member_capacity) {
+                // 용량 확장 로직 필요 (realloc 등)
+                // 여기서는 생략하고 break
+                break; 
+            }
+            member = &parent_var->members[parent_var->member_count];
+
+            // 1. 멤버 이름 가져오기
+            get_die_name(dbg, child_die, member_name, sizeof(member_name));
+            strncpy(member->name, member_name, sizeof(member->name) - 1);
+
+            // 2. 멤버 위치 (offset) 가져오기
+            res = dwarf_attr(child_die, DW_AT_data_member_location, &attr, &error);
+            if (res == DW_DLV_OK) {
+                // DWARF 버전에 따라 form이 다를 수 있음 (상수 또는 loclist)
+                // 여기서는 간단히 상수로 가정 (DW_FORM_data* or DW_FORM_udata)
+                dwarf_formudata(attr, &data_member_location, &error);
+                dwarf_dealloc(dbg, attr, DW_DLA_ATTR);
+            }
+
+            // 3. 멤버 주소 계산 (부모 주소 + 오프셋)
+            member->address = parent_var->address + data_member_location;
+            member->is_local = parent_var->is_local;
+            member->frame_level = parent_var->frame_level;
+
+            // 4. 멤버 타입 정보 및 크기 가져오기
+            fill_var_type_info(dbg, child_die, member, ctx);
+
+            // 5. 멤버 값 읽기
+            size_t read_size = (member->size > TDWARF_MAX_DUMP_SIZE) ? TDWARF_MAX_DUMP_SIZE : member->size;
+            if (tdwarf_read_memory(ctx, member->address, member->data, read_size) == TDWARF_OK) {
+                member->data_len = read_size;
+            }
+
+            // 6. (옵션) 멤버가 또 구조체라면 재귀 호출
+            if (member->type_kind == TDWARF_TYPE_STRUCT) {
+                Dwarf_Attribute type_attr;
+                if (dwarf_attr(child_die, DW_AT_type, &type_attr, &error) == DW_DLV_OK) {
+                    Dwarf_Off type_offset;
+                    if (dwarf_global_formref(type_attr, &type_offset, &error) == DW_DLV_OK) {
+                        Dwarf_Die type_die;
+                        if (dwarf_offdie(dbg, type_offset, &type_die, &error) == DW_DLV_OK) {
+                            process_struct_members(ctx, dbg, type_die, member);
+                            dwarf_dealloc(dbg, type_die, DW_DLA_DIE);
+                        }
+                    }
+                    dwarf_dealloc(dbg, type_attr, DW_DLA_ATTR);
+                }
+            }
+
+            parent_var->member_count++;
+        }
+
+        res = dwarf_siblingof(dbg, child_die, &sibling_die, &error);
+        dwarf_dealloc(dbg, child_die, DW_DLA_DIE);
+        if (res != DW_DLV_OK) {
+            break;
+        }
+        child_die = sibling_die;
     }
 }
 
@@ -1311,7 +1124,7 @@ static void process_global_variable(tdwarf_context_t *ctx, Dwarf_Debug dbg, Dwar
     DEBUG_PRINT("  %s: address = 0x%lX (load_offset=0x%lX)", 
                 var_name, (unsigned long)var->address, (unsigned long)internal->load_address);
     
-    fill_var_type_info(dbg, var_die, var);
+    fill_var_type_info(dbg, var_die, var, ctx);
     DEBUG_PRINT("  %s: type=%s, size=%zu", var_name, var->type_name, var->size);
     
     read_size = (var->size > TDWARF_MAX_DUMP_SIZE) ? TDWARF_MAX_DUMP_SIZE : var->size;
@@ -1327,8 +1140,7 @@ static void process_global_variable(tdwarf_context_t *ctx, Dwarf_Debug dbg, Dwar
 /*
  * Process a local variable DIE for a specific frame
  */
-static void process_local_variable(tdwarf_context_t *ctx, Dwarf_Debug dbg, 
-                                    Dwarf_Die var_die, tdwarf_frame_t *frame)
+static void process_local_variable(tdwarf_context_t *ctx, Dwarf_Debug dbg, Dwarf_Die var_die, tdwarf_frame_t *frame)
 {
     tdwarf_var_t *var;
     location_info_t loc;
@@ -1394,7 +1206,7 @@ static void process_local_variable(tdwarf_context_t *ctx, Dwarf_Debug dbg,
     var->is_local = 1;
     var->frame_level = frame->frame_level;
     
-    fill_var_type_info(dbg, var_die, var);
+    fill_var_type_info(dbg, var_die, var, ctx);
     DEBUG_PRINT("  %s: type=%s, size=%zu", var_name, var->type_name, var->size);
     
     read_size = (var->size > TDWARF_MAX_DUMP_SIZE) ? TDWARF_MAX_DUMP_SIZE : var->size;
@@ -1410,8 +1222,7 @@ static void process_local_variable(tdwarf_context_t *ctx, Dwarf_Debug dbg,
 /*
  * Get function address range from DW_TAG_subprogram
  */
-static int get_function_range(Dwarf_Debug dbg, Dwarf_Die func_die, 
-                               uint64_t *low_pc, uint64_t *high_pc)
+static int get_function_range(Dwarf_Debug dbg, Dwarf_Die func_die, uint64_t *low_pc, uint64_t *high_pc)
 {
     Dwarf_Attribute attr;
     Dwarf_Error error;
@@ -1463,8 +1274,7 @@ static int get_function_range(Dwarf_Debug dbg, Dwarf_Die func_die,
 /*
  * Collect local variables from a function DIE
  */
-static void collect_local_vars_from_function(tdwarf_context_t *ctx, Dwarf_Debug dbg,
-                                              Dwarf_Die func_die, tdwarf_frame_t *frame)
+static void collect_local_vars_from_function(tdwarf_context_t *ctx, Dwarf_Debug dbg, Dwarf_Die func_die, tdwarf_frame_t *frame)
 {
     Dwarf_Error error;
     Dwarf_Die child_die = NULL;
@@ -1501,9 +1311,7 @@ static void collect_local_vars_from_function(tdwarf_context_t *ctx, Dwarf_Debug 
 /*
  * Find function containing PC and collect its local variables
  */
-static void find_function_and_collect_locals(tdwarf_context_t *ctx, Dwarf_Debug dbg,
-                                              Dwarf_Die cu_die, tdwarf_frame_t *frame,
-                                              uint64_t load_address)
+static void find_function_and_collect_locals(tdwarf_context_t *ctx, Dwarf_Debug dbg, Dwarf_Die cu_die, tdwarf_frame_t *frame, uint64_t load_address)
 {
     Dwarf_Error error;
     Dwarf_Die child_die = NULL;
@@ -1536,9 +1344,8 @@ static void find_function_and_collect_locals(tdwarf_context_t *ctx, Dwarf_Debug 
                 /* Check if target PC is within this function */
                 if (target_pc >= low_pc && target_pc < high_pc) {
                     strncpy(frame->function_name, func_name, sizeof(frame->function_name) - 1);
-                    DEBUG_PRINT("Found function: %s (0x%lX - 0x%lX) for PC 0x%lX",
-                               func_name, (unsigned long)low_pc, (unsigned long)high_pc,
-                               (unsigned long)frame->pc);
+                    DEBUG_PRINT("Found function: %s (0x%lX - 0x%lX) for PC 0x%lX", func_name, 
+                        (unsigned long)low_pc, (unsigned long)high_pc, (unsigned long)frame->pc);
                     
                     /* Collect local variables */
                     collect_local_vars_from_function(ctx, dbg, child_die, frame);
@@ -1666,7 +1473,7 @@ static void collect_all_variables(tdwarf_context_t *ctx)
         
         /* Reset CU iteration for this frame */
         dwarf_finish(dbg, &error);
-        res = dwarf_elf_init(internal->elf, DW_DLC_READ, NULL, NULL,
+        res = dwarf_elf_init(internal->elf, DW_DLC_READ, NULL, NULL, 
                              &internal->dbg, &internal->error);
         if (res != DW_DLV_OK) {
             continue;
@@ -1676,8 +1483,7 @@ static void collect_all_variables(tdwarf_context_t *ctx)
         /* Iterate through CUs to find the function containing this PC */
         while (1) {
             res = dwarf_next_cu_header(dbg, &cu_header_length, &version_stamp,
-                                       &abbrev_offset, &address_size,
-                                       &next_cu_header, &error);
+                    &abbrev_offset, &address_size, &next_cu_header, &error);
             if (res != DW_DLV_OK) {
                 break;
             }
@@ -1694,17 +1500,15 @@ static void collect_all_variables(tdwarf_context_t *ctx)
             }
         }
         
-        DEBUG_PRINT("Frame #%d: Found %d local variables in %s",
-                   frame_idx, frame->var_count, 
-                   frame->function_name[0] ? frame->function_name : "<unknown>");
+        DEBUG_PRINT("Frame #%d: Found %d local variables in %s", 
+            frame_idx, frame->var_count, frame->function_name[0] ? frame->function_name : "<unknown>");
     }
 }
 
 /*
  * Stack unwinding
  */
-tdwarf_error_t tdwarf_unwind_stack(tdwarf_context_t *ctx)
-{
+tdwarf_error_t tdwarf_unwind_stack(tdwarf_context_t *ctx) {
     if (!ctx) {
         return TDWARF_ERR_INVALID_ARG;
     }
@@ -1731,8 +1535,7 @@ tdwarf_error_t tdwarf_unwind_stack(tdwarf_context_t *ctx)
     return TDWARF_OK;
 }
 
-tdwarf_error_t tdwarf_resolve_variables(tdwarf_context_t *ctx, int frame_index)
-{
+tdwarf_error_t tdwarf_resolve_variables(tdwarf_context_t *ctx, int frame_index) {
     if (!ctx || frame_index < 0 || frame_index >= ctx->frame_count) {
         return TDWARF_ERR_INVALID_ARG;
     }
@@ -1743,9 +1546,7 @@ tdwarf_error_t tdwarf_resolve_variables(tdwarf_context_t *ctx, int frame_index)
  * Format hex string
  */
 int tdwarf_format_hex(const uint8_t *data, size_t len,
-                      char *buf, size_t buf_size,
-                      int uppercase)
-{
+    char *buf, size_t buf_size, int uppercase) {
     const char *fmt = uppercase ? "%02X" : "%02x";
     size_t pos = 0;
     size_t i;
@@ -1767,8 +1568,7 @@ int tdwarf_format_hex(const uint8_t *data, size_t len,
 /*
  * Format value based on type
  */
-static void format_value_by_type(const tdwarf_var_t *var, char *buf, size_t buf_size)
-{
+static void format_value_by_type(const tdwarf_var_t *var, char *buf, size_t buf_size) {
     if (var->data_len == 0) {
         snprintf(buf, buf_size, "<unavailable>");
         return;
@@ -1779,25 +1579,20 @@ static void format_value_by_type(const tdwarf_var_t *var, char *buf, size_t buf_
         size_t len = var->data_len;
         size_t str_len = strnlen((char*)var->data, len);
         if (str_len > 60) str_len = 60;
-        snprintf(buf, buf_size, "\"%.*s\"%s", (int)str_len, (char*)var->data,
-                 (str_len < len && var->data[str_len] != '\0') ? "..." : "");
+        snprintf(buf, buf_size, "\"%.*s\"%s", (int)str_len, (char*)var->data, (str_len < len && var->data[str_len] != '\0') ? "..." : "");
         return;
     }
     
     switch (var->type_kind) {
         case TDWARF_TYPE_INT:
             if (var->size == 1) {
-                snprintf(buf, buf_size, "%d (0x%02X)", 
-                         (int)read_int8(var->data), var->data[0]);
+                snprintf(buf, buf_size, "%d (0x%02X)", (int)read_int8(var->data), var->data[0]);
             } else if (var->size == 2) {
-                snprintf(buf, buf_size, "%d (0x%04X)", 
-                         (int)read_int16(var->data), read_uint16(var->data));
+                snprintf(buf, buf_size, "%d (0x%04X)", (int)read_int16(var->data), read_uint16(var->data));
             } else if (var->size == 4) {
-                snprintf(buf, buf_size, "%d (0x%08X)", 
-                         read_int32(var->data), read_uint32(var->data));
+                snprintf(buf, buf_size, "%d (0x%08X)", read_int32(var->data), read_uint32(var->data));
             } else if (var->size == 8) {
-                snprintf(buf, buf_size, "%ld (0x%016lX)", 
-                         (long)read_int64(var->data), (unsigned long)read_uint64(var->data));
+                snprintf(buf, buf_size, "%ld (0x%016lX)", (long)read_int64(var->data), (unsigned long)read_uint64(var->data));
             } else {
                 char hex[128];
                 size_t len = (var->data_len > 32) ? 32 : var->data_len;
@@ -1810,14 +1605,11 @@ static void format_value_by_type(const tdwarf_var_t *var, char *buf, size_t buf_
             if (var->size == 1) {
                 snprintf(buf, buf_size, "%u (0x%02X)", var->data[0], var->data[0]);
             } else if (var->size == 2) {
-                snprintf(buf, buf_size, "%u (0x%04X)", 
-                         read_uint16(var->data), read_uint16(var->data));
+                snprintf(buf, buf_size, "%u (0x%04X)", read_uint16(var->data), read_uint16(var->data));
             } else if (var->size == 4) {
-                snprintf(buf, buf_size, "%u (0x%08X)", 
-                         read_uint32(var->data), read_uint32(var->data));
+                snprintf(buf, buf_size, "%u (0x%08X)", read_uint32(var->data), read_uint32(var->data));
             } else if (var->size == 8) {
-                snprintf(buf, buf_size, "%lu (0x%016lX)", 
-                         (unsigned long)read_uint64(var->data), (unsigned long)read_uint64(var->data));
+                snprintf(buf, buf_size, "%lu (0x%016lX)", (unsigned long)read_uint64(var->data), (unsigned long)read_uint64(var->data));
             } else {
                 char hex[128];
                 size_t len = (var->data_len > 32) ? 32 : var->data_len;
@@ -1872,13 +1664,300 @@ static void format_value_by_type(const tdwarf_var_t *var, char *buf, size_t buf_
     }
 }
 
+static void print_var_recursive(FILE *stream, tdwarf_var_t *var, int indent, const tdwarf_config_t *config) {
+    char value_buf[512];
+    char indent_str[64] = {0};
+    int k;
+    
+    for(k=0; k<indent && k<60; k++) indent_str[k] = ' ';
+    indent_str[k] = '\0';
+
+    format_value_by_type(var, value_buf, sizeof(value_buf));
+
+    fprintf(stream, "%s%-32s %-24s 0x%016lX %s\n",
+            indent_str,
+            var->name,
+            var->type_name[0] ? var->type_name : "<unknown>",
+            (unsigned long)var->address,
+            value_buf);
+
+    // 구조체 멤버 출력
+    if (var->type_kind == TDWARF_TYPE_STRUCT && var->member_count > 0) {
+        for (int i = 0; i < var->member_count; i++) {
+            print_var_recursive(stream, &var->members[i], indent + 2, config);
+        }
+    }
+}
+
+
 /*
- * Dump to stream
+ * Context creation/destruction 
  */
-tdwarf_error_t tdwarf_dump_to_stream(tdwarf_context_t *ctx,
-                                      FILE *stream,
-                                      const tdwarf_config_t *config)
-{
+tdwarf_error_t tdwarf_context_create(pid_t pid, tdwarf_context_t **ctx) {
+    tdwarf_context_t *new_ctx;
+    tdwarf_internal_t *internal;
+    int i;
+    
+    if (!ctx) {
+        return TDWARF_ERR_INVALID_ARG;
+    }
+    
+    new_ctx = calloc(1, sizeof(tdwarf_context_t));
+    if (!new_ctx) {
+        return TDWARF_ERR_NO_MEMORY;
+    }
+    
+    internal = calloc(1, sizeof(tdwarf_internal_t));
+    if (!internal) {
+        free(new_ctx);
+        return TDWARF_ERR_NO_MEMORY;
+    }
+    internal->fd = -1;
+    internal->global_var_capacity = 512;
+    internal->global_vars = calloc(internal->global_var_capacity, sizeof(tdwarf_var_t));
+    if (!internal->global_vars) {
+        free(internal);
+        free(new_ctx);
+        return TDWARF_ERR_NO_MEMORY;
+    }
+    
+    new_ctx->target_pid = (pid == 0) ? getpid() : pid;
+    new_ctx->dwarf_handle = internal;
+    new_ctx->attached = 0;
+    
+    /* Initialize frame variable arrays */
+    for (i = 0; i < TDWARF_MAX_FRAMES; i++) {
+        new_ctx->frames[i].variables = calloc(256, sizeof(tdwarf_var_t));
+        new_ctx->frames[i].var_count = 0;
+        new_ctx->frames[i].var_capacity = 256;
+    }
+    
+    if (get_executable_path(new_ctx->target_pid, 
+                            new_ctx->executable_path,
+                            sizeof(new_ctx->executable_path)) < 0) {
+        for (i = 0; i < TDWARF_MAX_FRAMES; i++) {
+            if (new_ctx->frames[i].variables) free(new_ctx->frames[i].variables);
+        }
+        free(internal->global_vars);
+        free(internal);
+        free(new_ctx);
+        return TDWARF_ERR_OPEN_FAILED;
+    }
+    
+    *ctx = new_ctx;
+    return TDWARF_OK;
+}
+
+void tdwarf_context_destroy(tdwarf_context_t *ctx) {
+    tdwarf_internal_t *internal;
+    int i;
+    
+    if (!ctx) return;
+    
+    if (ctx->attached) {
+        tdwarf_detach(ctx);
+    }
+    
+    internal = (tdwarf_internal_t*)ctx->dwarf_handle;
+    if (internal) {
+        if (internal->dbg) {
+            Dwarf_Error err;
+            dwarf_finish(internal->dbg, &err);
+        }
+        if (internal->elf) {
+            elf_end(internal->elf);
+        }
+        if (internal->fd >= 0) {
+            close(internal->fd);
+        }
+        if (internal->global_vars) {
+            free(internal->global_vars);
+        }
+        free(internal);
+    }
+    
+    for (i = 0; i < TDWARF_MAX_FRAMES; i++) {
+        if (ctx->frames[i].variables) {
+            free(ctx->frames[i].variables);
+        }
+    }
+    
+    if (ctx->output_file) {
+        fclose(ctx->output_file);
+    }
+    
+    free(ctx);
+}
+
+/*
+ * Ptrace attachment/detachment
+ */
+tdwarf_error_t tdwarf_attach(tdwarf_context_t *ctx) {
+    int status;
+    
+    if (!ctx) {
+        return TDWARF_ERR_INVALID_ARG;
+    }
+    
+    if (ctx->target_pid == getpid()) {
+        ctx->attached = 1;
+        return TDWARF_OK;
+    }
+    
+    if (ptrace(PTRACE_ATTACH, ctx->target_pid, NULL, NULL) < 0) {
+        DEBUG_PRINT("ptrace ATTACH failed: %s", strerror(errno));
+        return TDWARF_ERR_PTRACE;
+    }
+    
+    if (waitpid(ctx->target_pid, &status, 0) < 0) {
+        ptrace(PTRACE_DETACH, ctx->target_pid, NULL, NULL);
+        return TDWARF_ERR_PTRACE;
+    }
+    
+    ctx->attached = 1;
+    DEBUG_PRINT("Attached to PID %d", ctx->target_pid);
+    return TDWARF_OK;
+}
+
+tdwarf_error_t tdwarf_detach(tdwarf_context_t *ctx) {
+    if (!ctx || !ctx->attached) {
+        return TDWARF_ERR_INVALID_ARG;
+    }
+    
+    if (ctx->target_pid != getpid()) {
+        if (ptrace(PTRACE_DETACH, ctx->target_pid, NULL, NULL) < 0) {
+            return TDWARF_ERR_PTRACE;
+        }
+    }
+    
+    ctx->attached = 0;
+    return TDWARF_OK;
+}
+
+/*
+ * Load DWARF debug information
+ */
+tdwarf_error_t tdwarf_load_debug_info(tdwarf_context_t *ctx) {
+    tdwarf_internal_t *internal;
+    int res;
+    
+    if (!ctx) {
+        return TDWARF_ERR_INVALID_ARG;
+    }
+    
+    internal = (tdwarf_internal_t*)ctx->dwarf_handle;
+    
+    internal->is_pie = check_is_pie(ctx->executable_path);
+    internal->load_address = get_load_address(ctx->target_pid, ctx->executable_path, internal->is_pie);
+    DEBUG_PRINT("Final load_address offset: 0x%lX (is_pie=%d)", 
+                (unsigned long)internal->load_address, internal->is_pie);
+    
+    internal->fd = open(ctx->executable_path, O_RDONLY);
+    if (internal->fd < 0) {
+        DEBUG_PRINT("Cannot open executable: %s", ctx->executable_path);
+        return TDWARF_ERR_OPEN_FAILED;
+    }
+    
+    internal->elf = elf_begin(internal->fd, ELF_C_READ, NULL);
+    if (!internal->elf) {
+        DEBUG_PRINT("elf_begin failed");
+        close(internal->fd);
+        internal->fd = -1;
+        return TDWARF_ERR_OPEN_FAILED;
+    }
+    
+    res = dwarf_elf_init(internal->elf, DW_DLC_READ, NULL, NULL, &internal->dbg, &internal->error);
+    if (res != DW_DLV_OK) {
+        DEBUG_PRINT("dwarf_elf_init failed: res=%d", res);
+        elf_end(internal->elf);
+        internal->elf = NULL;
+        close(internal->fd);
+        internal->fd = -1;
+        return TDWARF_ERR_NO_DWARF;
+    }
+    
+    DEBUG_PRINT("DWARF initialized successfully");
+    return TDWARF_OK;
+}
+
+/*
+ * Read memory from target process
+ */
+tdwarf_error_t tdwarf_read_memory(tdwarf_context_t *ctx, uint64_t addr, void *buf, size_t len) {
+    char proc_mem_path[64];
+    int fd;
+    ssize_t bytes_read;
+    
+    if (!ctx || !buf || len == 0) {
+        return TDWARF_ERR_INVALID_ARG;
+    }
+    
+    snprintf(proc_mem_path, sizeof(proc_mem_path), "/proc/%d/mem", ctx->target_pid);
+    
+    fd = open(proc_mem_path, O_RDONLY);
+    if (fd >= 0) {
+        DEBUG_PRINT("Reading memory from %s at 0x%lX, len=%zu", 
+            proc_mem_path, (unsigned long)addr, len);
+        if (lseek(fd, addr, SEEK_SET) == (off_t)addr) {
+            bytes_read = read(fd, buf, len);
+            close(fd);
+            if (bytes_read == (ssize_t)len) {
+                return TDWARF_OK;
+            }
+        } else {
+            DEBUG_PRINT("lseek failed: %s", strerror(errno));
+            close(fd);
+        }
+    } else {
+        DEBUG_PRINT("Cannot open %s: %s", proc_mem_path, strerror(errno));
+    }
+    
+    {
+        struct iovec local_iov;
+        struct iovec remote_iov;
+        local_iov.iov_base = buf;
+        local_iov.iov_len = len;
+        remote_iov.iov_base = (void*)addr;
+        remote_iov.iov_len = len;
+        
+        bytes_read = process_vm_readv(ctx->target_pid, &local_iov, 1, &remote_iov, 1, 0);
+        DEBUG_PRINT("process_vm_readv read %zd bytes from 0x%lX", 
+                    bytes_read, (unsigned long)addr);
+        if (bytes_read == (ssize_t)len) {
+            return TDWARF_OK;
+        }
+        DEBUG_PRINT("process_vm_readv failed: %s", strerror(errno));
+    }
+    
+    if (ctx->attached && ctx->target_pid != getpid()) {
+        size_t offset = 0;
+        DEBUG_PRINT("reading memory via ptrace PEEKDATA at 0x%lX, len=%zu", 
+            (unsigned long)addr, len);
+        
+        while (offset < len) {
+            long word;
+            size_t copy_len;
+            errno = 0;
+            word = ptrace(PTRACE_PEEKDATA, ctx->target_pid, addr + offset, NULL);
+            if (errno != 0) {
+                DEBUG_PRINT("ptrace PEEKDATA failed: %s", strerror(errno));
+                return TDWARF_ERR_READ_MEM;
+            }
+            
+            copy_len = (len - offset < sizeof(long)) ? (len - offset) : sizeof(long);
+            memcpy((char*)buf + offset, &word, copy_len);
+            offset += sizeof(long);
+        }
+        return TDWARF_OK;
+    }
+    
+    return TDWARF_ERR_READ_MEM;
+}
+
+/*
+ * Dump symbol information to stream/file
+ */
+tdwarf_error_t tdwarf_dump_to_stream(tdwarf_context_t *ctx, FILE *stream, const tdwarf_config_t *config) {
     tdwarf_internal_t *internal;
     tdwarf_config_t cfg;
     time_t now;
@@ -1920,31 +1999,35 @@ tdwarf_error_t tdwarf_dump_to_stream(tdwarf_context_t *ctx,
     
     /* Global Variables */
     if (cfg.dump_globals && internal && internal->global_var_count > 0) {
-        fprintf(stream, "GLOBAL VARIABLES (%d found)\n", internal->global_var_count);
-        fprintf(stream, "--------------------------------------------------------------------------------\n");
-        fprintf(stream, "%-32s %-24s %-18s %s\n", "Name", "Type", "Address", "Value");
-        fprintf(stream, "--------------------------------------------------------------------------------\n");
+    //     fprintf(stream, "GLOBAL VARIABLES (%d found)\n", internal->global_var_count);
+    //     fprintf(stream, "--------------------------------------------------------------------------------\n");
+    //     fprintf(stream, "%-32s %-24s %-18s %s\n", "Name", "Type", "Address", "Value");
+    //     fprintf(stream, "--------------------------------------------------------------------------------\n");
         
+    //     for (i = 0; i < internal->global_var_count; i++) {
+    //         tdwarf_var_t *var = &internal->global_vars[i];
+            
+    //         format_value_by_type(var, value_buf, sizeof(value_buf));
+            
+    //         fprintf(stream, "%-32s %-24s 0x%016lX %s\n",
+    //                 var->name,
+    //                 var->type_name[0] ? var->type_name : "<unknown>",
+    //                 (unsigned long)var->address,
+    //                 value_buf);
+            
+    //         if (cfg.verbose && var->data_len > 8) {
+    //             size_t k;
+    //             fprintf(stream, "  Hex dump (%zu bytes):\n", var->data_len);
+    //             for (k = 0; k < var->data_len && k < 512; k += 16) {
+    //                 size_t line_len = (var->data_len - k > 16) ? 16 : (var->data_len - k);
+    //                 tdwarf_format_hex(var->data + k, line_len, hex_buf, sizeof(hex_buf), cfg.hex_uppercase);
+    //                 fprintf(stream, "    %04zX: %s\n", k, hex_buf);
+    //             }
+    //         }
+    //     }
+    
         for (i = 0; i < internal->global_var_count; i++) {
-            tdwarf_var_t *var = &internal->global_vars[i];
-            
-            format_value_by_type(var, value_buf, sizeof(value_buf));
-            
-            fprintf(stream, "%-32s %-24s 0x%016lX %s\n",
-                    var->name,
-                    var->type_name[0] ? var->type_name : "<unknown>",
-                    (unsigned long)var->address,
-                    value_buf);
-            
-            if (cfg.verbose && var->data_len > 8) {
-                size_t k;
-                fprintf(stream, "  Hex dump (%zu bytes):\n", var->data_len);
-                for (k = 0; k < var->data_len && k < 512; k += 16) {
-                    size_t line_len = (var->data_len - k > 16) ? 16 : (var->data_len - k);
-                    tdwarf_format_hex(var->data + k, line_len, hex_buf, sizeof(hex_buf), cfg.hex_uppercase);
-                    fprintf(stream, "    %04zX: %s\n", k, hex_buf);
-                }
-            }
+            print_var_recursive(stream, &internal->global_vars[i], 0, &cfg);
         }
         fprintf(stream, "\n");
     } else if (cfg.dump_globals) {
@@ -2012,10 +2095,7 @@ tdwarf_error_t tdwarf_dump_to_stream(tdwarf_context_t *ctx,
     return TDWARF_OK;
 }
 
-tdwarf_error_t tdwarf_dump_to_file(tdwarf_context_t *ctx,
-                                    const char *filename,
-                                    const tdwarf_config_t *config)
-{
+tdwarf_error_t tdwarf_dump_to_file(tdwarf_context_t *ctx, const char *filename, const tdwarf_config_t *config) {
     FILE *file;
     tdwarf_error_t err;
     
@@ -2037,8 +2117,7 @@ tdwarf_error_t tdwarf_dump_to_file(tdwarf_context_t *ctx,
 /*
  * Signal handler
  */
-static void tdwarf_signal_handler(int signum, siginfo_t *info, void *context)
-{
+static void tdwarf_signal_handler(int signum, siginfo_t *info, void *context) {
     char filename[1024];
     time_t now;
     struct tm *tm_info;
@@ -2074,8 +2153,7 @@ static void tdwarf_signal_handler(int signum, siginfo_t *info, void *context)
     raise(signum);
 }
 
-tdwarf_error_t tdwarf_install_signal_handlers(const char *output_dir)
-{
+tdwarf_error_t tdwarf_install_signal_handlers(const char *output_dir) {
     struct sigaction sa;
     int signals[] = { SIGSEGV, SIGBUS, SIGFPE, SIGILL, SIGABRT };
     int num_signals = sizeof(signals) / sizeof(signals[0]);
@@ -2101,8 +2179,7 @@ tdwarf_error_t tdwarf_install_signal_handlers(const char *output_dir)
     return TDWARF_OK;
 }
 
-void tdwarf_remove_signal_handlers(void)
-{
+void tdwarf_remove_signal_handlers(void) {
     int signals[] = { SIGSEGV, SIGBUS, SIGFPE, SIGILL, SIGABRT };
     int num_signals = sizeof(signals) / sizeof(signals[0]);
     int i;
@@ -2118,8 +2195,7 @@ void tdwarf_remove_signal_handlers(void)
     g_handlers_installed = 0;
 }
 
-tdwarf_error_t tdwarf_dump_on_signal(int signum, const char *output_path)
-{
+tdwarf_error_t tdwarf_dump_on_signal(int signum, const char *output_path) {
     FILE *file;
     time_t now;
     char time_str[64];
